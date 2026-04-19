@@ -8,10 +8,11 @@ import unicodedata
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pypdf import PdfReader, PdfWriter
 
-TARGET_SIZE_MB = 4.8  # Use slightly less than 5MB to be safe
+TARGET_SIZE_MB = 0.9  # Use slightly less than 1MB to be safe
 TARGET_SIZE_BYTES = TARGET_SIZE_MB * 1024 * 1024
 OUTPUT_DIR = "splitted_pdfs"
 MANIFEST_FILE = "split_manifest.json"
+MAX_WORKERS = max(1, (os.cpu_count() or 4) // 2)  # Limit CPU usage to avoid machine lag
 
 def process_chunk(input_path, output_path, start_page, end_page):
     """
@@ -101,7 +102,7 @@ def main():
     # First, to fast-inspect PDFs & prepare split tasks (PdfReader can take some time).
     all_chunk_tasks = []
     
-    with ProcessPoolExecutor() as executor:
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         # Submit all analysis jobs
         futures = {executor.submit(process_pdf, pdf): pdf for pdf in target_pdfs}
         for future in as_completed(futures):
@@ -115,7 +116,7 @@ def main():
     if all_chunk_tasks:
         print(f"[{time.strftime('%X')}] Found {len(all_chunk_tasks)} chunks to generate. Processing in parallel...")
         # Second multiprocessing pool for actually doing the extraction
-        with ProcessPoolExecutor() as executor:
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
             chunk_futures = [executor.submit(process_chunk, *task) for task in all_chunk_tasks]
             
             completed = 0
