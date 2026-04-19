@@ -80,56 +80,115 @@ def process_pdf(pdf_path):
 def main():
     start_time = time.time()
     
-    # 1. Force cut preparation: Delete old outputs
-    if os.path.exists(OUTPUT_DIR):
-        print(f"[{time.strftime('%X')}] Deleting old {OUTPUT_DIR}...")
-        shutil.rmtree(OUTPUT_DIR)
-    os.makedirs(OUTPUT_DIR)
-    
-    # Find all PDFs in the current directory and subdirectories (excluding splitted_pdfs)
+    # 1. Ensure output dir exists
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+        
+    # Find all PDFs in the current directory and subdirectories
     all_pdfs = glob.glob("**/*.pdf", recursive=True)
     target_pdfs = [p for p in all_pdfs if not p.startswith(OUTPUT_DIR)]
     
     manifest = {
         "_comment": "This file is auto-generated. It maps original large PDF files to their split chunks for lazy loading.",
         "large_files_to_ignore": [],
-        "groups": {}
+        "groups": {},
+        "metadata": {}
     }
     
-    print(f"[{time.strftime('%X')}] Found {len(target_pdfs)} PDFs to inspect.")
-    
-    # We will use multiprocessing twice.
-    # First, to fast-inspect PDFs & prepare split tasks (PdfReader can take some time).
-    all_chunk_tasks = []
-    
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Submit all analysis jobs
-        futures = {executor.submit(process_pdf, pdf): pdf for pdf in target_pdfs}
-        for future in as_completed(futures):
-            pdf_path, is_split, result_tasks_or_none, subfiles = future.result() if len(future.result()) == 4 else (*future.result(), None)
+    old_manifest = {}
+    if os.path.exists(MANIFEST_FILE):
+        try:
+            with open(MANIFEST_FILE, "r", encoding="utf-8") as f:
+                old_manifest = json.load(f)
+        except Exception:
+            pass
             
-            if is_split:
-                manifest["large_files_to_ignore"].append(pdf_path)
-                manifest["groups"][pdf_path] = subfiles
-                all_chunk_tasks.extend(result_tasks_or_none)
+    old_metadata = old_manifest.get("metadata", {})
+    old_groups = old_manifest.get("groups", {})
     
+    pdfs_to_process = []
+    skipped_pdfs = []
+    
+    for pdf_path in target_pdfs:
+        mtime = os.path.getmtime(pdf_path)
+        size = os.path.getsize(pdf_path)
+        
+        # Check if modified
+        if pdf_path in old_metadata and pdf_path in old_groups:
+            old_mtime = old_metadata[pdf_path].get("mtime")
+            old_size = old_metadata[pdf_path].get("size")
+            out_files = old_groups[pdf_path]
+            
+            # Check if chunks actually exist on disk
+            all_exist = all(os.path.exists(f) for f in out_files)
+            
+            if old_mtime == mtime and old_size == size and all_exist:
+                skipped_pdfs.append((pdf_path, out_files, mtime, size))
+                continue
+                
+        pdfs_to_process.append((pdf_path, mtime, size))
+        
+    print(f"[{time.strftime('%X')}] Found {len(pdfs_to_process)} PDFs to process (modified/new). Skipped {len(skipped_pdfs)} unchanged.")
+    
+    all_chunk_tasks = []
+    processed_metadata = {}
+    
+    # Add skipped back to manifest
+    for pdf_path, out_files, mtime, size in skipped_pdfs:
+        manifest["large_files_to_ignore"].append(pdf_path)
+        manifest["groups"][pdf_path] = out_files
+        processed_metadata[pdf_path] = {"mtime": mtime, "size": size}
+        
+    if pdfs_to_process:
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(process_pdf, p[0]): p for p in pdfs_to_process}
+            for future in as_completed(futures):
+                pdf_path, mtime, size = futures[future]
+                res = future.result()
+                res_pdf_path, is_split, result_tasks, subfiles = res if len(res) == 4 else (*res, None)
+                
+                # Delete old chunks if they existed (whether it grew small or changed chunks)
+                if pdf_path in old_groups:
+                    for old_f in old_groups[pdf_path]:
+                        if os.path.exists(old_f):
+                            os.remove(old_f)
+                            
+                if is_split:
+                    manifest["large_files_to_ignore"].append(pdf_path)
+                    manifest["groups"][pdf_path] = subfiles
+                    processed_metadata[pdf_path] = {"mtime": mtime, "size": size}
+                    if result_tasks:
+                        all_chunk_tasks.extend(result_tasks)
+
+    manifest["metadata"] = processed_metadata
+
     if all_chunk_tasks:
         print(f"[{time.strftime('%X')}] Found {len(all_chunk_tasks)} chunks to generate. Processing in parallel...")
-        # Second multiprocessing pool for actually doing the extraction
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
             chunk_futures = [executor.submit(process_chunk, *task) for task in all_chunk_tasks]
-            
             completed = 0
             for future in as_completed(chunk_futures):
                 try:
-                    generated_file = future.result()
+                    future.result()
                     completed += 1
                     if completed % 10 == 0 or completed == len(all_chunk_tasks):
                         print(f"[{time.strftime('%X')}] Progress: {completed}/{len(all_chunk_tasks)} chunks created.")
                 except Exception as exc:
                     print(f"Chunk processing generated an exception: {exc}")
     else:
-        print(f"[{time.strftime('%X')}] No large PDFs found that needed splitting.")
+        print(f"[{time.strftime('%X')}] No new chunks need to be generated.")
+        
+    # Cleanup orphaned chunks
+    valid_subfiles = set()
+    for sublist in manifest["groups"].values():
+        valid_subfiles.update(sublist)
+        
+    for existing_chunk in glob.glob(os.path.join(OUTPUT_DIR, "*.pdf")):
+        if existing_chunk not in valid_subfiles:
+            try:
+                os.remove(existing_chunk)
+            except Exception:
+                pass
 
     # Auto update .gitignore to ignore large origin files
     # macOS uses NFD (decomposed) unicode for filenames, so we must normalize
